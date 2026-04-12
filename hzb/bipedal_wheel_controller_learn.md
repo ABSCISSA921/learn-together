@@ -20,7 +20,7 @@
 
 #### 2.数学与算法对象
 
-`vmc_`：实例化 `VMC` 类的对象，用于处理五连杆的运动学正解和逆解
+`vmc_`：指向 `VMC` 类的智能指针，用于处理五连杆的运动学正解和逆解
 
 `kalmanFilterPtr_`：实例化卡尔曼滤波器对象，专门用于“车轮打滑检测 (Slippage detection)”，融合 IMU 加速度和轮速来估算真实的底盘线速度
 
@@ -366,3 +366,124 @@ Phase 3 `OFF_GROUND`（腾空收腿）：施加负拉力促使在空中将腿收
 越障退出评估 (Exit)：
 条件：当左右双腿的实际长度都被成功压缩到 0.2m 以下 (left_pos_[0] < 0.2)，且腿部的实际夹角超越了设定的安全门限角 `(upstair_exit_threshold)`
 动作：这说明机体已经上了台阶。此时发送一个“完成上楼梯”的 ROS 消息。接着，将模式移交给 STAND_UP (起立模式)，让机器人在台阶上方重新像开机时那样从摔倒状态下爬起来。
+
+
+## 数据处理链路
+
+### 1.接收指令
+系统获取底盘期望的前进速度（vel_cmd_.x）、旋转角速度（vel_cmd_.z），以及期望的腿长（legCmd_）
+
+代码追踪（controller.cpp）：
+auto legCmdCallback = [this](const rm_msgs::LegCmd::ConstPtr& msg) {
+  legCmd_ = msg->leg_length;
+  jumpCmd_ = msg->jump;
+};
+
+### 2.接收传感器数据
+数据流转：读取 IMU 原始角速度 (gyro) 和加速度 (acc)。
+
+读取电机编码器反馈的髋关节 (hip) 和膝关节 (knee) 的实际角度与角速度。
+
+代码追踪（controller.cpp - updateEstimation）：
+// 1. 获取 IMU 数据
+gyro.x = imu_handle_.getAngularVelocity()[0];
+acc.x = imu_handle_.getLinearAcceleration()[0];
+
+// 2. 获取真实的关节角度
+left_angle[0] = left_hip_joint_handle_.getPosition() + M_PI; // 髋关节
+left_angle[1] = left_knee_joint_handle_.getPosition();       // 膝关节
+
+### 3.VMC解算
+计算过程：传入获取的电机角度，利用几何关系解算出虚拟摆杆的**长度（pos[0]）和摆角（pos[1]）**及其导数
+
+代码追踪（controller.cpp）：
+// 输入：真实关节角 left_angle[0], left_angle[1]
+// 输出：虚拟腿长 left_pos[0], 虚拟腿摆角 left_pos[1]
+vmc_->leg_pos(left_angle[0], left_angle[1], left_pos);
+
+// 计算对应的速度，并经过低通滤波平滑处理
+vmc_->leg_spd(left_hip_joint_handle_.getVelocity(), left_knee_joint_handle_.getVelocity(), left_angle[0], left_angle[1], left_spd);
+left_spd[1] = left_leg_angle_vel_lpFilterPtr_->output();
+
+### 4.状态向量构建与卡尔曼滤波（State Estimation）
+计算过程：计算出真实的机体前进速度 x_hat_vel(0)。随后，将所有处理好的数据填入状态向量 x_left_ 和 x_right_。这两个向量是后续 LQR 核心算法的唯一输入。变量结构：状态向量 $X = [\theta, \dot{\theta}, x, \dot{x}, \phi, \dot{\phi}]^T$
+代码追踪（controller.cpp）：C++// 融合计算真实的机体速度
+kalmanFilterPtr_->update(X_, R_);
+auto x_hat_vel = kalmanFilterPtr_->getState();
+
+// 组装状态向量 x_left_ 传递给下一棒
+x_left_[0] = (left_pos[1] + pitch);      // 摆杆绝对角度 \theta
+x_left_[1] = left_spd[1] + angular_vel_base.y; // 摆杆绝对角速度 \dot{\theta}
+x_left_[2] += x_left_[3] * period.toSec(); // 机体位移 x
+x_left_[3] = x_hat_vel(0);               // 机体真实线速度 \dot{x}
+x_left_[4] = -pitch;                     // 机体俯仰角 \phi
+x_left_[5] = -angular_vel_base.y;        // 机体俯仰角速度 \dot{\phi}
+
+### 5.进入Normal控制模式（Mode Execution）
+状态估算完成后，主循环将打包好的状态向量传递给当前工作的状态机模式
+
+代码追踪（controller.cpp -> normal.cpp）：
+
+// 在 controller 中传递数据
+mode_manager_->getModeImpl()->updateEstimation(x_left_, x_right_);
+// 在 controller 中触发执行
+mode_manager_->getModeImpl()->execute(this, time, period);
+
+### 6.LQR变增益计算
+计算过程：根据第三棒算出的当前腿长 pos[0]，利用多项式动态插值算出当前物理构型下的 $K$ 矩阵。然后计算误差并输出控制向量 $U$。输出数据：$U$ 是一个 2 维向量。u_left(0) 是轮部驱动力矩，u_left(1) 是髋部虚拟平衡力矩。
+代码追踪（normal.cpp）：
+//1. 根据目标速度组装参考状态
+x_left_ref(3) = friction_circle_alpha * vel_cmd_.x; 
+
+//2. 根据当前腿长实时插值 LQR 的 K 矩阵
+for (int j = 0; j < 6; ++j) {
+  k_left(i, j) = coeffs_(0, i + 2 * j) * pow(left_pos_[0], 3) + ... ;
+}
+
+//3. 计算误差并输出力矩 u = K * (X_ref - X_curr)
+x_left -= x_left_ref; 
+u_left = k_left * (-x_left); 
+
+### 7.辅助姿态PID计算
+LQR 只解决前后方向的平衡和移动。高度（腿伸缩）、左右偏航（转向）、横滚（防侧翻）由 PID 独立计算。
+
+输出数据：T_yaw（差速转向扭矩）、F_pid_left（腿部直立推力）、F_roll（侧倾补偿力）。
+
+代码追踪（normal.cpp）：
+// 计算转向需要的差速扭矩
+double T_yaw = pid_yaw_vel_->computeCommand(friction_circle_alpha * vel_cmd_.z - angular_vel_base_.z, period);
+// 计算维持期望腿长需要的推力
+double F_pid_left = pid_legs_[LEFT]->computeCommand(left_length_des - current_leg_length, period);
+
+### 8.虚拟力与力矩最终合成
+腿部纵向总推力 (F_leg) = PID 高度推力 + 离心力补偿 + 重力前馈 + 横滚补偿 - 机械弹簧力
+轮子总力矩 (wheel_cmd) = LQR 前进/平衡力矩 $\pm$ 差速转向力矩
+
+代码追踪（normal.cpp）：
+// 合成虚拟杆沿轴向的总推力
+F_leg[LEFT] = F_pid_left - F_inertia + gravity * cos(left_pos_[1]) + F_roll - spring_force;
+
+// 合成最终发给轮子电机的扭矩
+double left_wheel_cmd = left_unstick ? 0. : u_left(0) - T_yaw;
+
+### 9.虚拟模型逆解算
+这是核心的降维打击恢复步骤。我们在五连杆上等效出了一个虚拟摆杆并算出了需要施加的 F_leg 和 u_left(1)，现在必须通过雅可比矩阵转置将其重新映射给真实的髋关节和膝关节电机
+
+数据流转：输入虚拟推力与力矩，结合当前物理关节角度，输出真实电机所需的扭矩 left_T[0] 和 left_T[1]
+
+代码追踪（normal.cpp）：
+// leg_conv 内部包含雅可比矩阵 J^T 的乘法运算
+// F_leg[LEFT] : 杆轴向总推力 (来自第八棒)
+// u_left(1)   : 杆摆动平衡扭矩 (来自 LQR 输出)
+// left_T      : 数组，存储最终解算出的 髋关节[0] 和 膝关节[1] 扭矩
+controller->getVMCPtr()->leg_conv(F_leg[LEFT], u_left(1) + T_theta_diff, left_angle_[0], left_angle_[1], left_T);
+
+### 10.硬件指令下发
+最后一步，将所有经过解算和限制的关节扭矩发送给底层电机驱动器，完成物理层的闭环
+代码追踪（normal.cpp）：
+
+// 组装左右腿的数据结构
+LegCommand left_cmd = { F_leg[LEFT], u_left[1], { left_T[0], left_T[1] } };
+
+// 发送指令给底层硬件抽象层
+setJointCommands(joint_handles_, left_cmd, right_cmd, left_wheel_cmd, right_wheel_cmd);
