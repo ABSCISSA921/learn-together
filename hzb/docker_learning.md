@@ -33,7 +33,7 @@ Bash
 
 方法 1：命令行进入（开通终端）
 
-Bash
+Bashsudo chown -R $USER:$USER .
 
 `docker exec -it ros1_noetic_dev bash (alisa der)`
 
@@ -124,3 +124,8 @@ sudo systemctl restart docker
 ## 队内docker配置仓库
 
 https://github.com/HydrogenZp/common-ros-noetic-docker 预装常用调车工具以及依赖，构建后可顺利编译队内代码的Dockerfile和docker-compose.yml文件 https://github.com/users/HydrogenZp/packages/container/package/common-ros-noetic-docker 对应的镜像，每当那个仓库有commit都会跑一次action把镜像提交到这个github package
+
+## 其他
+### 释放文件所有权
+bash
+`sudo chown -R $USER:$USER .`
