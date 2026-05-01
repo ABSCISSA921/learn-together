@@ -75,7 +75,7 @@ Bash
 Bash
 
 `docker compose stop`
-
+docker_learning.md
 ## 6.彻底销毁容器（拆除系统）
 如果你修改了 docker-compose.yml，或者容器环境被你玩坏了想要重置，你需要销毁它。别担心，你的代码和 VS Code 插件都在挂载卷里，不会丢失。
 
